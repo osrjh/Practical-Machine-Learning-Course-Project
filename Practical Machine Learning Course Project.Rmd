@@ -1,0 +1,316 @@
+---
+title: "Practical Machine Learning Course Project"
+date: "`r Sys.Date()`"
+author: "Jack"
+output: 
+  html_document:
+    keep_md: true
+    toc: true
+    toc_float: true
+---
+
+## Introduction
+
+The goal of this project is to use data from accelerometers to predict the manner in which participants did a number of exercises. This report will describe how I built the model and what I think the expected out of sample error is. Decisions will be justified and the prediction model will be used to predict 20 different test cases. Any R code will be provided in the appendix section along with any plots generated.
+
+## Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website [here](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset)).
+
+
+### Data
+
+The training data for this project are available [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+
+The test data are available [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+
+The data for this project come from this [source](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har). 
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. **Qualitative Activity Recognition of Weight Lifting Exercises.** Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human ’13)”. Stuttgart, Germany: ACM SIGCHI, 2013.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      fig.align = "center")
+
+r = getOption("repos")
+r["CRAN"] = "https://cran.curtin.edu.au/"
+options(repos = r)
+options(scipen = 999)
+```
+
+## Data Pre-Processing
+
+### Package Install
+
+First, we load the necessary packages to conduct analysis and build the model.
+
+```{r}
+packages <- c("caret", "dplyr","randomForest", "rpart", "rattle")
+installed_packages <- packages %in% rownames(installed.packages())
+
+if(any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages], type = "source")
+}
+
+update.packages(packages)
+
+invisible(lapply(packages, library, character.only=TRUE))
+```
+
+### Loading the Data
+
+Next, we load the data from the data source.
+
+1. pml-training.csv (our training dataset)
+2. pml-testing.csv (our testing dataset)
+
+```{r }
+trainURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+
+testURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+trainData <- "./Data/pml-training.csv"
+testData <- "./Data/pml-testing.csv"
+
+if (!file.exists("./Data")) {
+  dir.create("./Data")
+}
+
+if (!file.exists(trainData)) {
+  download.file(trainURL, destfile = trainData, method = "curl")
+}
+
+if (!file.exists(testData)) {
+  download.file(testURL, destfile = testData, method = "curl")
+}
+
+training <- read.csv("Data/pml-training.csv")
+testing <- read.csv("Data/pml-testing.csv")
+```
+
+### Data Partitioning
+
+Before performing any data processing, we will split the training data into train and test sets. 
+
+```{r}
+set.seed(100)
+trainIndex <- createDataPartition(training$classe, p = 0.60, list=FALSE)
+
+train <- training[trainIndex,]; test <- training[-trainIndex,]
+trainobs <- dim(train)[1]; testobs <- dim(test)[1]
+```
+
+The training set has `r trainobs` observations and while the testing set has `r testobs` observations.
+
+### Data Cleansing
+
+Before we move onto building the model, we will perform some data transformation on the testing, training and test data sets.
+
+#### Removing Zero Covariates
+
+In order to clean the data, first we will remove the following columns as they do not show any variance. 
+
+```{r}
+names(train) -> coln
+noVarIndex <- nearZeroVar(train, saveMetrics = FALSE)
+coln[noVarIndex]
+
+train.nzv <- train[,-noVarIndex]
+test.nzv <- test[,-noVarIndex]
+testing.nzv <- testing[,-noVarIndex]
+
+names(train.nzv) -> coln
+```
+
+#### Missing Values
+
+Now, we will remove columns which have at least 90% missing values. 
+
+```{r}
+miscol <- sapply(train.nzv, function(x) sum(is.na(x))/length(x))
+miscolnames <- coln[miscol > 0.9]
+
+train.mc <- train.nzv[!miscol > 0.9] 
+test.mc <- test.nzv[!miscol > 0.9]
+testing.mc <- testing.nzv[!miscol > 0.9]
+
+names(train.mc) -> coln
+
+miscol2 <- sapply(train.mc, function(x) sum(is.na(x))/length(x))
+miscol2
+```
+
+As there are no more missing values, we will not peform any imputation.
+
+#### Removing ID Columns
+
+Now, we will remove identifying columns and columns which will not be useful in predicting exercise manner.
+
+```{r}
+IDcol <- grep("X|user|timestamp|window",names(train.mc))
+coln[IDcol]
+
+train.id <- train.mc[,-IDcol] 
+testing.id <- testing.mc[,-IDcol] 
+test.id <- test.mc[,-IDcol] 
+```
+
+#### Data Scaling
+
+To reduce the effects of skewed data, we will standardise the numeric/integer columns. 
+
+```{r}
+train.scaled <- train.id
+for (i in 1:length(train.id)){
+  if (class(train.id[,i]) == "numeric|integer"){
+    train.scaled[,i] <- scale(train.id[,i])
+  }
+  else {
+    train.scaled[,i] <- train.id[,i]
+  }
+}
+
+test.scaled <- test.id
+for (i in 1:length(test.id)){
+  if (class(test.id[,i]) == "numeric|integer"){
+    test.scaled[,i] <- scale(test.id[,i])
+  }
+  else {
+    test.scaled[,i] <- test.id[,i]
+  }
+}
+
+testing.scaled <- testing.id
+for (i in 1:length(testing.id)){
+  if (class(testing.id[,i]) == "numeric|integer"){
+    testing.scaled[,i] <- scale(testing.id[,i])
+  }
+  else {
+    testing.scaled[,i] <- testing.id[,i]
+  }
+}
+```
+
+Predictor variables which have high correlations are listed below:
+
+```{r, include = F, eval = F}
+#Predictor variables which have high correlations are listed below:
+M <- abs(cor(train.scaled[-53]))
+diag(M) <- 0
+which(M > 0.8, arr.ind=T) 
+```
+
+Converting the classe dependent variable into a factor column.
+
+```{r}
+train.scaled %>%
+  mutate(classe = factor(classe)) -> train.scaled 
+
+test.scaled %>%
+  mutate(classe = factor(classe)) -> test.scaled 
+
+testing.scaled %>%
+  select(-problem_id) -> testing.scaled
+```
+
+## Model Building
+
+We will build models using different supervised machine learning algorithms and select the best model based on the stats generated from the associated confusion matrices.
+
+To prevent overfitting with trees, we will perform cross-validation with ten folds when applicable. We chose ten to reduce the bias and get an accurate estimate of the error between the predicted and validation values.
+
+### Decision Tree Model
+
+A basic algorithm - start with all the variables of one big group. Then, find the first variable that best splits the outcomes into two homogenous groups. Continue to divide the groups until they are homogeneous enough or small enough that you need to stop.
+
+```{r, cache = T}
+control <- trainControl(method = "cv", number = 10)
+modFitDT <- train(classe ~ ., data = train.scaled, method="rpart", trControl=control, tuneGrid = data.frame(cp=0.03)) 
+## The complexity parameter (cp) in rpart is the min. improvement needed at each node of the model
+modFitDT
+
+predictionsDT <- predict(modFitDT, newdata = test.id)
+cmDT <- confusionMatrix(predictionsDT, test.scaled$classe)
+cmDT
+```
+
+### Random Forest Model
+
+Random forests are usually one of the top-performing algorithms in prediction contests - an extension to bagging for classification and regression trees. The basic idea is very similar to bagging because we bootstrap samples. We take a resample of our observed data and our training data set. Then, we rebuild classification or regression trees on each of these bootstrap samples.
+
+```{r, cache = T}
+control <- trainControl(method = "cv", number = 10)
+modFitRF <- train(classe ~ ., data = train.scaled, method="rf", trControl=control)
+modFitRF
+
+predictionsRF <- predict(modFitRF, newdata = test.id)
+cmRF <- confusionMatrix(predictionsRF, test.scaled$classe)
+cmRF
+```
+
+### Gradient Boosted Tree Model
+
+Boosting is one of the most accurate out-of-the-box classifiers that you can use. The basic idea is you take a large number of possibly weak predictors and weigh them in a way that takes advantage of their strengths and add them up.
+
+```{r, cache = T}
+control <- trainControl(method = "cv", number = 10)
+modFitGB <- train(classe ~., data = train.scaled, method = "gbm", trControl = control, verbose = F)
+modFitGB
+
+predictionsGB <- predict(modFitGB, newdata = test.scaled)
+cmGB <- confusionMatrix(predictionsGB, test.scaled$classe)
+cmGB
+```
+
+## Results
+
+A summary of the modelling results is given below - ordered by descending accuracy.
+
+```{r}
+accuracy <- rbind(cmDT$overall[1], cmRF$overall[1], cmGB$overall[1])
+
+rownames(accuracy) <- c("Decision Tree", "Random Forest", "Gradient Boosted Trees")
+accuracy %>% 
+  as.data.frame() %>%
+  mutate(`Out of Sample Error` = 1-Accuracy) %>%
+  arrange(`Out of Sample Error`) -> results
+
+results 
+```
+
+The best performing model based on accuracy (`r paste0(results[1,1]*100,"%")`) and out of sample error (`r paste0(results[1,2]*100,"%")`) is the Random Forest model.
+
+## Predictions
+
+Now we will apply our machine learning algorithm to the 20 test cases available in the test data.
+
+```{r}
+predictions <- predict(modFitRF, newdata = testing.scaled, type = "raw") 
+predictions
+```
+
+## Appendix
+
+### A. R Code 
+
+```{r ref.label=knitr::all_labels(), echo = TRUE, eval = FALSE}
+```
+
+### B. Decision Tree
+
+```{r}
+fancyRpartPlot(modFitDT$finalModel, uniform = T, main = "Classification Tree")
+```
+
+### C. Random Forest Model Accuracy vs Randomly Selected Predictors
+
+```{r}
+plot(modFitRF)
+```
+
+### D. Gradient Boosted Trees Model Accuracy vs Randomly Selected Predictors
+
+```{r}
+plot(modFitGB)
+```
